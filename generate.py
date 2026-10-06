@@ -51,6 +51,7 @@ CHAR_W     = FONT_SIZE * 0.63  # safe monospace width estimate (covers wider fal
 ANIMATE    = True
 ASCII_STEP = 0.06   # seconds between ASCII rows
 TYPE_STEP  = 0.12   # seconds between info lines
+LOOP_TEXT  = "Hello World!"   # typed + backspaced forever after the prompt (set "" to disable)
 
 THEMES = {
     "dark":  dict(bg="#161b22", text="#c9d1d9", key="#ffa657", value="#a5d6ff",
@@ -225,6 +226,50 @@ def invert_ascii(line):
     return "".join(RAMP[n - RAMP.index(ch)] if ch in RAMP and ch != " " else ch for ch in line)
 
 
+def typing_loop(prompt, x, y, start, c):
+    """Frame-based typing loop: one <text> per state, so the cursor always sits exactly
+    after the last character, whatever font the viewer has."""
+    text = LOOP_TEXT
+    if not text:
+        return "", [f'<text class="t" x="{x:.1f}" y="{y}" xml:space="preserve">'
+                    f'<tspan class="add">{escape(prompt)}</tspan></text>']
+    seq = []                                   # (chars shown, cursor on, duration)
+    for k in range(len(text) + 1):
+        seq.append((k, True, 0.10))            # typing
+    for i in range(4):
+        seq.append((len(text), i % 2 == 1, 0.5))   # hold + blink
+    for k in range(len(text) - 1, -1, -1):
+        seq.append((k, True, 0.06))            # backspace
+    for i in range(2):
+        seq.append((0, i % 2 == 1, 0.5))       # empty + blink
+    total = sum(d for *_, d in seq)
+
+    spans, t = {}, 0.0
+    for k, cur, d in seq:
+        spans.setdefault((k, cur), []).append((t / total * 100, (t + d) / total * 100))
+        t += d
+
+    css, els, pad = [], [], " " * len(prompt)
+    for n, ((k, cur), ivs) in enumerate(sorted(spans.items())):
+        kf = ["0%{opacity:0}"] if ivs[0][0] > 0 else []
+        for a, b in ivs:
+            kf.append(f"{a:.3f}%{{opacity:1}}")
+            if b < 99.999:
+                kf.append(f"{b:.3f}%{{opacity:0}}")
+        if ivs[-1][1] < 99.999:
+            kf.append("100%{opacity:0}")
+        css.append(f"@keyframes lp{n}{{{''.join(kf)}}}"
+                   f".lp{n}{{opacity:0;animation:lp{n} {total:.2f}s step-end {start:.2f}s infinite}}")
+        final = " final" if (k == len(text) and not cur) else ""
+        els.append(f'<text class="lp{n}{final}" x="{x:.1f}" y="{y}" xml:space="preserve">'
+                   f'{pad}<tspan class="value">{escape(text[:k])}</tspan>'
+                   f'<tspan class="text">{"█" if cur else ""}</tspan></text>')
+    css.append("@media (prefers-reduced-motion:reduce){[class^=lp]{animation:none!important}.final{opacity:1!important}}")
+    prompt_el = (f'<text class="t" x="{x:.1f}" y="{y}" xml:space="preserve" '
+                 f'style="animation-delay:{start - 0.5:.2f}s"><tspan class="add">{escape(prompt)}</tspan></text>')
+    return "".join(css), [prompt_el] + els
+
+
 def render(theme):
     c = THEMES[theme]
     ascii_lines = open("ascii.txt", encoding="utf-8").read().rstrip("\n").split("\n")
@@ -280,16 +325,14 @@ def render(theme):
         out.append(f'<text class="t text" x="{x_info:.1f}" y="{y0 + i*LINE_H}" '
                    f'xml:space="preserve"{delay(t0 + i * TYPE_STEP)}>{inner}</text>')
 
-    # 3) Shell prompt with blinking cursor
+    # 3) Shell prompt with a looping typing effect
     if ANIMATE:
         y = y0 + (rows - 1) * LINE_H
         t_end = t0 + len(info_lines) * TYPE_STEP + 0.3
         prompt = f"{USERNAME}@github:~$ "
-        out.append(f'<text class="t" x="{x_info:.1f}" y="{y}" xml:space="preserve"{delay(t_end)}>'
-                   f'<tspan class="add">{escape(prompt)}</tspan></text>')
-        cx = x_info + len(prompt) * CHAR_W * 0.95
-        out.append(f'<rect class="cur" x="{cx:.1f}" y="{y - FONT_SIZE + 3}" width="{CHAR_W*0.9:.1f}" '
-                   f'height="{FONT_SIZE}" fill="{c["text"]}"{delay(t_end + 0.45)}/>')
+        css, els = typing_loop(prompt, x_info, y, t_end + 0.5, c)
+        out[3] = out[3] + css                       # append keyframes to the <style> block
+        out += els
 
     out.append("</svg>")
     with open(f"{theme}_mode.svg", "w", encoding="utf-8") as f:
