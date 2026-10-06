@@ -4,6 +4,9 @@ Edit the CONFIG section, then run:  python generate.py
 """
 from datetime import datetime, timedelta, timezone
 import calendar
+import json
+import os
+import urllib.request
 from xml.sax.saxutils import escape
 
 # ============================ CONFIG ============================
@@ -30,7 +33,9 @@ CONTACT = [
     ("LinkedIn", "in/dylanmorenoz"),
 ]
 
-# Filled in automatically in Step 5 (GitHub Actions). Placeholders for now.
+INCLUDE_PRIVATE = True   # count private repos too (needs token with "repo" scope)
+
+# Placeholders, used when no ACCESS_TOKEN is set (e.g. running locally)
 STATS = {
     "repos": "-", "contributed": "-", "stars": "-",
     "commits": "-", "followers": "-",
@@ -116,6 +121,96 @@ def build_lines():
     return lines
 
 
+# ======================= GITHUB STATS =======================
+API = "https://api.github.com/graphql"
+
+
+def gql(query, variables, token):
+    req = urllib.request.Request(
+        API, data=json.dumps({"query": query, "variables": variables}).encode(),
+        headers={"Authorization": f"bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.load(r)
+    if res.get("errors") and not res.get("data"):
+        raise RuntimeError(res["errors"])
+    return res["data"]
+
+
+def list_repos(token, affiliations):
+    privacy = "" if INCLUDE_PRIVATE else ", privacy: PUBLIC"
+    q = """query($login:String!, $cursor:String) { user(login:$login) {
+      repositories(first:100, after:$cursor, ownerAffiliations:[%s]%s) {
+        totalCount pageInfo { hasNextPage endCursor }
+        nodes { name owner { login } stargazerCount } } } }""" % (",".join(affiliations), privacy)
+    repos, cursor = [], None
+    while True:
+        d = gql(q, {"login": USERNAME, "cursor": cursor}, token)["user"]["repositories"]
+        repos += d["nodes"]
+        if not d["pageInfo"]["hasNextPage"]:
+            return repos
+        cursor = d["pageInfo"]["endCursor"]
+
+
+def repo_loc(token, owner, name, user_id):
+    q = """query($owner:String!, $name:String!, $cursor:String, $id:ID!) {
+      repository(owner:$owner, name:$name) { defaultBranchRef { target { ... on Commit {
+        history(first:100, after:$cursor, author:{id:$id}) {
+          pageInfo { hasNextPage endCursor } nodes { additions deletions } } } } } } }"""
+    add = dele = 0
+    cursor = None
+    while True:
+        repo = gql(q, {"owner": owner, "name": name, "cursor": cursor, "id": user_id}, token)["repository"]
+        if not repo or not repo["defaultBranchRef"]:
+            return 0, 0          # empty repo
+        h = repo["defaultBranchRef"]["target"]["history"]
+        for n in h["nodes"]:
+            add += n["additions"]
+            dele += n["deletions"]
+        if not h["pageInfo"]["hasNextPage"]:
+            return add, dele
+        cursor = h["pageInfo"]["endCursor"]
+
+
+def fetch_stats(token):
+    info = gql("""query($login:String!) { user(login:$login) {
+        id createdAt followers { totalCount }
+        repositoriesContributedTo(first:1, includeUserRepositories:false,
+          contributionTypes:[COMMIT, PULL_REQUEST]) { totalCount } } }""",
+        {"login": USERNAME}, token)["user"]
+
+    owned = list_repos(token, ["OWNER"])
+    stars = sum(r["stargazerCount"] for r in owned)
+
+    # Commits: sum contribution calendar year by year since the account was created
+    commits = 0
+    start = datetime.fromisoformat(info["createdAt"].replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    while start < now:
+        end = min(start + timedelta(days=365), now)
+        commits += gql("""query($login:String!, $from:DateTime!, $to:DateTime!) { user(login:$login) {
+            contributionsCollection(from:$from, to:$to) { totalCommitContributions } } }""",
+            {"login": USERNAME, "from": start.isoformat(), "to": end.isoformat()},
+            token)["user"]["contributionsCollection"]["totalCommitContributions"]
+        start = end
+
+    # Lines of code: your own commits in every repo you own / collaborate on / are an org member of
+    add = dele = 0
+    for r in list_repos(token, ["OWNER", "COLLABORATOR", "ORGANIZATION_MEMBER"]):
+        try:
+            a, d = repo_loc(token, r["owner"]["login"], r["name"], info["id"])
+            add, dele = add + a, dele + d
+        except Exception as e:
+            print(f"  skip {r['owner']['login']}/{r['name']}: {e}")
+
+    f = lambda n: f"{n:,}"
+    return {
+        "repos": f(len(owned)), "contributed": f(info["repositoriesContributedTo"]["totalCount"]),
+        "stars": f(stars), "commits": f(commits), "followers": f(info["followers"]["totalCount"]),
+        "loc": f(add - dele), "loc_add": f(add), "loc_del": f(dele),
+    }
+
+
+# ========================= RENDERING =========================
 RAMP = " .:-=+*#%@"
 
 
@@ -163,6 +258,12 @@ def render(theme):
 
 
 if __name__ == "__main__":
+    token = os.environ.get("ACCESS_TOKEN")
+    if token:
+        STATS.update(fetch_stats(token))
+        print("Stats:", STATS)
+    else:
+        print("No ACCESS_TOKEN set -> using placeholder stats")
     for t in THEMES:
         render(t)
     print("Generated dark_mode.svg & light_mode.svg | Uptime:", uptime())
