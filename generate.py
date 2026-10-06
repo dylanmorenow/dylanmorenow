@@ -47,6 +47,11 @@ FONT_SIZE  = 16
 LINE_H     = 20
 CHAR_W     = FONT_SIZE * 0.63  # safe monospace width estimate (covers wider fallback fonts)
 
+# Animation (plays once when the page loads, then only the cursor blinks)
+ANIMATE    = True
+ASCII_STEP = 0.06   # seconds between ASCII rows
+TYPE_STEP  = 0.12   # seconds between info lines
+
 THEMES = {
     "dark":  dict(bg="#161b22", text="#c9d1d9", key="#ffa657", value="#a5d6ff",
                   dots="#616e7f", ascii="#c9d1d9", add="#3fb950", dele="#f85149"),
@@ -230,29 +235,63 @@ def render(theme):
     pad = 20
     x_ascii = pad
     x_info = pad + ascii_w * CHAR_W + 30
-    rows = max(len(ascii_lines), len(info_lines))
+    rows = max(len(ascii_lines), len(info_lines)) + (2 if ANIMATE else 0)   # +prompt line
     width = int(x_info + WIDTH * CHAR_W + pad)
     height = int(rows * LINE_H + pad * 2)
     y0 = pad + LINE_H - 4
 
-    out = [f'<?xml version="1.0" encoding="UTF-8"?>',
+    anim_css = ""
+    if ANIMATE:
+        anim_css = (
+            ".a{opacity:0;animation:fade .45s ease-out forwards}"
+            ".t{opacity:0;clip-path:inset(0 100% 0 0);animation:type .45s steps(30,end) forwards}"
+            ".cur{opacity:0;animation:show 0s forwards,blink 1.1s step-end infinite}"
+            "@keyframes fade{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}"
+            "@keyframes type{0%{opacity:1;clip-path:inset(0 100% 0 0)}100%{opacity:1;clip-path:inset(0 0 0 0)}}"
+            "@keyframes show{to{opacity:1}}"
+            "@keyframes blink{0%{opacity:1}50%{opacity:0}}"
+            "@media (prefers-reduced-motion:reduce){.a,.t,.cur{animation:none;opacity:1;clip-path:none}}"
+        )
+
+    def delay(sec):
+        return f' style="animation-delay:{sec:.2f}s"' if ANIMATE else ""
+
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
            f'<svg xmlns="http://www.w3.org/2000/svg" font-family="Consolas, Menlo, \'Courier New\', monospace" '
            f'width="{width}" height="{height}" viewBox="0 0 {width} {height}" font-size="{FONT_SIZE}px">',
            "<style>",
            f".text{{fill:{c['text']}}} .key{{fill:{c['key']}}} .value{{fill:{c['value']}}} "
            f".dots{{fill:{c['dots']}}} .add{{fill:{c['add']}}} .dele{{fill:{c['dele']}}} "
-           f"text, tspan{{white-space:pre}}",
+           f"text, tspan{{white-space:pre}}" + anim_css,
            "</style>",
-           f'<rect width="{width}" height="{height}" fill="{c["bg"]}" rx="15"/>',
-           f'<text x="{x_ascii}" y="{y0}" fill="{c["ascii"]}" xml:space="preserve">']
+           f'<rect width="{width}" height="{height}" fill="{c["bg"]}" rx="15"/>']
+
+    # 1) ASCII portrait fades in from top to bottom
     for i, l in enumerate(ascii_lines):
-        out.append(f'<tspan x="{x_ascii}" y="{y0 + i*LINE_H}">{escape(l)}</tspan>')
-    out.append("</text>")
-    out.append(f'<text x="{x_info}" y="{y0}" class="text" xml:space="preserve">')
+        out.append(f'<text class="a" x="{x_ascii}" y="{y0 + i*LINE_H}" fill="{c["ascii"]}" '
+                   f'xml:space="preserve"{delay(i * ASCII_STEP)}>{escape(l)}</text>')
+
+    # 2) Info lines get "typed" one after another
+    t0 = len(ascii_lines) * ASCII_STEP * 0.6
     for i, segs in enumerate(info_lines):
+        if not segs:
+            continue
         inner = "".join(f'<tspan class="{cls}">{escape(t)}</tspan>' for t, cls in segs)
-        out.append(f'<tspan x="{x_info:.1f}" y="{y0 + i*LINE_H}">{inner}</tspan>')
-    out.append("</text></svg>")
+        out.append(f'<text class="t text" x="{x_info:.1f}" y="{y0 + i*LINE_H}" '
+                   f'xml:space="preserve"{delay(t0 + i * TYPE_STEP)}>{inner}</text>')
+
+    # 3) Shell prompt with blinking cursor
+    if ANIMATE:
+        y = y0 + (rows - 1) * LINE_H
+        t_end = t0 + len(info_lines) * TYPE_STEP + 0.3
+        prompt = f"{USERNAME}@github:~$ "
+        out.append(f'<text class="t" x="{x_info:.1f}" y="{y}" xml:space="preserve"{delay(t_end)}>'
+                   f'<tspan class="add">{escape(prompt)}</tspan></text>')
+        cx = x_info + len(prompt) * CHAR_W * 0.95
+        out.append(f'<rect class="cur" x="{cx:.1f}" y="{y - FONT_SIZE + 3}" width="{CHAR_W*0.9:.1f}" '
+                   f'height="{FONT_SIZE}" fill="{c["text"]}"{delay(t_end + 0.45)}/>')
+
+    out.append("</svg>")
     with open(f"{theme}_mode.svg", "w", encoding="utf-8") as f:
         f.write("\n".join(out))
 
